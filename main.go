@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"time"
 )
 
@@ -35,12 +36,14 @@ func (n *Netdata) encode() []byte {
 }
 
 type client struct {
-	network string
-	addr    string
-	conn    net.Conn
-	state   state
-	txBufr  chan Netdata
-	txDone  chan bool
+	network     string
+	addr        string
+	conn        net.Conn
+	state       state
+	txBufr      chan Netdata
+	txDone      chan bool
+	txThreshold float32 // channel threshold in %
+	backup      *bufio.Writer
 }
 
 type server struct {
@@ -48,13 +51,15 @@ type server struct {
 	addr    string
 }
 
-func NewClient(ip string, port string, cap int) *client {
+func NewClient(ip string, port string, cap int, threshold int, backupWriter *bufio.Writer) *client {
 	return &client{
-		network: "tcp",
-		addr:    fmt.Sprintf("%s:%s", ip, port),
-		state:   OFFLINE,
-		txBufr:  make(chan Netdata, cap), // between writer and transmitter
-		txDone:  make(chan bool),         // all data in channel is transmitted
+		network:     "tcp",
+		addr:        fmt.Sprintf("%s:%s", ip, port),
+		state:       OFFLINE,
+		txBufr:      make(chan Netdata, cap), // between writer and transmitter
+		txDone:      make(chan bool),         // all data in channel is transmitted
+		backup:      backupWriter,
+		txThreshold: float32(threshold) / float32(cap) * 100,
 	}
 }
 
@@ -84,28 +89,31 @@ func main() {
 	time.Sleep(2 * time.Second) // wait for server to start
 
 	// client
-	cli := NewClient("127.0.0.1", "31500", 10)
+
+	f, _ := os.OpenFile("backup.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	defer f.Close()
+	cli := NewClient("127.0.0.1", "31500", 100, 60, bufio.NewWriter(f))
 	cli.run()
 	time.Sleep(2 * time.Second) // wait for client
 
 	// to transmit
 	tData := make([]byte, 6)
-	for i := range [200]int32{} {
+	for i := range [10]int32{} {
 		binary.LittleEndian.PutUint16(tData[:2], uint16(i))
 		copy(tData[2:], "TEST")
 		cli.Writer([]byte(tData))
 	}
-
 	cli.close()
+
 	time.Sleep(2 * time.Second) // wait for server to print
 }
 
 func (c *client) close() {
 	fmt.Printf("[CLIENT]  disconnecting (remote: %s)\n", c.conn.RemoteAddr())
-	defer c.conn.Close()
 	c.state = OFFLINE // no more writes
 	close(c.txBufr)
 	<-c.txDone // wait for channel to empty
+	c.conn.Close()
 	fmt.Printf("[CLIENT]  disconnected (remote: %s)\n", c.conn.RemoteAddr())
 }
 
@@ -123,9 +131,15 @@ func (c *client) run() error {
 }
 
 func (c *client) handle() {
+	var bw *bufio.Writer
+	sbw := bufio.NewWriter(c.conn)
 	for {
+		fmt.Printf("[CLIENT]  channel (occupied: %d, capacity: %d)\n", len(c.txBufr), cap(c.txBufr))
+		bw = sbw
+		if float32(len(c.txBufr))/float32(cap(c.txBufr))*100 >= c.txThreshold && c.backup != nil {
+			bw = c.backup // threshold reached transmit to backup
+		}
 		if tx, open := <-c.txBufr; open {
-			bw := bufio.NewWriter(c.conn)
 			l, _ := bw.Write(tx.encode())
 			fmt.Printf("[CLIENT]  transmitted (size: %d): %v%s\n", l, tx.Data[:2], string(tx.Data[2:]))
 			bw.Flush()
@@ -162,7 +176,7 @@ func handleConnection(conn net.Conn, err error) {
 		len, err := conn.Read(buf)
 		if err != nil {
 			if err == io.EOF {
-				fmt.Printf("[SERVER]  closing client connection (addr: %s)\n", conn.RemoteAddr())
+				fmt.Printf("[SERVER]  client closed connection (addr: %s)\n", conn.RemoteAddr())
 			} else {
 				fmt.Printf("[SERVER]  read failed %v", err)
 			}
@@ -170,6 +184,5 @@ func handleConnection(conn net.Conn, err error) {
 			return
 		}
 		fmt.Printf("[SERVER]  received (size: %d): %v\n", len, buf[0:len])
-		time.Sleep(100 * time.Microsecond)
 	}
 }
