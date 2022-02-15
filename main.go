@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"time"
@@ -70,8 +71,7 @@ func (c *client) Writer(p []byte) (l int, err error) {
 		Cmd:  byte(1),
 		Arg:  [10]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 		Act:  byte(1),
-		Data: make([]byte, len(p)),
-		// Data: p,
+		Data: make([]byte, len(p)), // allocate or else new one will override data in channel
 	}
 	copy(tx.Data, p)
 	c.txBufr <- tx
@@ -101,11 +101,12 @@ func main() {
 }
 
 func (c *client) close() {
+	fmt.Printf("[CLIENT]  disconnecting (remote: %s)\n", c.conn.RemoteAddr())
 	defer c.conn.Close()
 	c.state = OFFLINE // no more writes
 	close(c.txBufr)
 	<-c.txDone // wait for channel to empty
-	fmt.Printf("[CLIENT]  disconnected (remote: %s)\n", c.addr)
+	fmt.Printf("[CLIENT]  disconnected (remote: %s)\n", c.conn.RemoteAddr())
 }
 
 func (c *client) run() error {
@@ -160,7 +161,11 @@ func handleConnection(conn net.Conn, err error) {
 	for {
 		len, err := conn.Read(buf)
 		if err != nil {
-			fmt.Printf("[SERVER]  read failed %v", err)
+			if err == io.EOF {
+				fmt.Printf("[SERVER]  closing client connection (addr: %s)\n", conn.RemoteAddr())
+			} else {
+				fmt.Printf("[SERVER]  read failed %v", err)
+			}
 			conn.Close()
 			return
 		}
