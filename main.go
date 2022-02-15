@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+type state byte
+
+const (
+	OFFLINE state = iota + 1
+	CONNECTED
+)
+
 type Netdata struct {
 	Len  uint32
 	Cmd  uint8
@@ -26,87 +33,138 @@ func (n *Netdata) encode() []byte {
 	return buf
 }
 
-type socketWriter struct {
+type client struct {
+	network string
+	addr    string
+	conn    net.Conn
+	state   state
+	txBufr  chan Netdata
+	txDone  chan bool
+}
+
+type server struct {
 	network string
 	addr    string
 }
 
-type socketReader struct {
-	network string
-	addr    string
+func NewClient(ip string, port string, cap int) *client {
+	return &client{
+		network: "tcp",
+		addr:    fmt.Sprintf("%s:%s", ip, port),
+		state:   OFFLINE,
+		txBufr:  make(chan Netdata, cap), // between writer and transmitter
+		txDone:  make(chan bool),         // all data in channel is transmitted
+	}
 }
 
-func NewSocketWriter(ip string, port string) *socketWriter {
-	return &socketWriter{
+func NewServer(ip string, port string) *server {
+	return &server{
 		network: "tcp",
 		addr:    fmt.Sprintf("%s:%s", ip, port),
 	}
 }
 
-func NewSocketReader(ip string, port string) *socketReader {
-	return &socketReader{
-		network: "tcp",
-		addr:    fmt.Sprintf("%s:%s", ip, port),
+func (c *client) Writer(p []byte) (l int, err error) {
+	tx := Netdata{
+		Len:  uint32(len(p) + 12),
+		Cmd:  byte(1),
+		Arg:  [10]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		Act:  byte(1),
+		Data: make([]byte, len(p)),
+		// Data: p,
 	}
+	copy(tx.Data, p)
+	c.txBufr <- tx
+	return
 }
 
 func main() {
 	fmt.Printf("testing socket\n")
-	go listen(NewSocketReader("127.0.0.1", "31500"))
-
+	go listen(NewServer("127.0.0.1", "31500"))
 	time.Sleep(2 * time.Second) // wait for server to start
-	sw := NewSocketWriter("127.0.0.1", "31500")
-	conn, err := net.Dial(sw.network, sw.addr)
-	if err != nil {
-		log.Fatalf("connection failed (remote: %s): %s\n", sw.addr, err)
-	}
-	// bw := bufio.NewWriter(conn)
-	// bw.Write([]byte("sending to server"))
-	// bw.Flush()
+
+	// client
+	cli := NewClient("127.0.0.1", "31500", 10)
+	cli.run()
+	time.Sleep(2 * time.Second) // wait for client
 
 	// to transmit
-	tData := "AAAAAAAAAAAAAAAAAAAA"
-	data := &Netdata{
-		Len:  uint32(len(tData) + 12),
-		Cmd:  byte(1),
-		Arg:  [10]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-		Act:  byte(1),
-		Data: []byte(tData),
+	tData := make([]byte, 6)
+	for i := range [200]int32{} {
+		binary.LittleEndian.PutUint16(tData[:2], uint16(i))
+		copy(tData[2:], "TEST")
+		cli.Writer([]byte(tData))
 	}
-	fmt.Printf("transmitting (size: %d): [ %s ]\n", len(data.encode()), data.encode())
-	bw := bufio.NewWriter(conn)
-	bw.Write(data.encode())
-	bw.Flush()
+
+	cli.close()
 	time.Sleep(2 * time.Second) // wait for server to print
-	conn.Close()
 }
 
-func listen(sr *socketReader) {
+func (c *client) close() {
+	defer c.conn.Close()
+	c.state = OFFLINE // no more writes
+	close(c.txBufr)
+	<-c.txDone // wait for channel to empty
+	fmt.Printf("[CLIENT]  disconnected (remote: %s)\n", c.addr)
+}
+
+func (c *client) run() error {
+	var err error
+	c.conn, err = net.Dial(c.network, c.addr)
+	if err != nil {
+		log.Fatalf("[CLIENT]  connection failed (remote: %s): %s\n", c.addr, err)
+		return err
+	}
+	c.state = CONNECTED
+	fmt.Printf("[CLIENT]  connected (remote: %s)\n", c.addr)
+	go c.handle()
+	return nil
+}
+
+func (c *client) handle() {
+	for {
+		if tx, open := <-c.txBufr; open {
+			bw := bufio.NewWriter(c.conn)
+			l, _ := bw.Write(tx.encode())
+			fmt.Printf("[CLIENT]  transmitted (size: %d): %v%s\n", l, tx.Data[:2], string(tx.Data[2:]))
+			bw.Flush()
+		} else {
+			fmt.Printf("[CLIENT]  closing handler\n")
+			c.txDone <- true
+			return
+		}
+	}
+}
+
+func listen(sr *server) {
 	listner, err := net.Listen(sr.network, sr.addr)
 	if err == nil {
-		fmt.Printf("server started (listning at: %s)\n", sr.addr)
+		fmt.Printf("[SERVER]  started (listning at: %s)\n", sr.addr)
 		for {
 			go handleConnection(listner.Accept())
 		}
 	}
 	defer listner.Close()
-	fmt.Printf("server failed (addr: %s): %v\n", sr.addr, err)
+	fmt.Printf("[SERVER]  failed (addr: %s): %v\n", sr.addr, err)
 }
 
 func handleConnection(conn net.Conn, err error) {
 	if err != nil {
-		fmt.Printf("incomming client conection failed %s\n", err)
+		fmt.Printf("[SERVER] connection failed %s\n", err)
 		return
 	}
 	defer conn.Close()
-	fmt.Printf("incomming conection: %s\n", conn.RemoteAddr())
+	fmt.Printf("[SERVER]  incomming conection: %s\n", conn.RemoteAddr())
 
-	buf := make([]byte, 20)
-	len, err := conn.Read(buf)
-	if err != nil {
-		fmt.Printf("read failed %v", err)
+	buf := make([]byte, 22)
+	for {
+		len, err := conn.Read(buf)
+		if err != nil {
+			fmt.Printf("[SERVER]  read failed %v", err)
+			conn.Close()
+			return
+		}
+		fmt.Printf("[SERVER]  received (size: %d): %v\n", len, buf[0:len])
+		time.Sleep(100 * time.Microsecond)
 	}
-
-	// fmt.Printf("received (size: %d): %v\n", len(data), data)
-	fmt.Printf("received (size: %d): %v\n", len, buf[0:len])
 }
